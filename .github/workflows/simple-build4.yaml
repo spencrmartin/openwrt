@@ -8,7 +8,77 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    # ... [dependencies and setup steps] ...
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          clang \
+          flex \
+          g++ \
+          gawk \
+          gcc-multilib \
+          g++-multilib \
+          git \
+          gettext \
+          libncurses5-dev \
+          libncurses-dev \
+          libssl-dev \
+          python3-dev \
+          python3-setuptools \
+          python3-pip \
+          rsync \
+          unzip \
+          zlib1g-dev \
+          swig \
+          wget \
+          curl \
+          file \
+          bc \
+          zip \
+          time \
+          ccache \
+          libc6-dev-i386
+        
+        python3 -m pip install --break-system-packages setuptools wheel || true
+    
+    - name: Initialize feeds
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+    
+    - name: Configure for Pi 4
+      run: |
+        if [ -f scripts/morse_setup.sh ] && [ -d boards/ekh-bcm2711 ]; then
+          echo "Using morse_setup.sh for Pi 4"
+          chmod +x scripts/morse_setup.sh
+          ./scripts/morse_setup.sh -i -b ekh-bcm2711 || echo "morse_setup.sh failed, continuing with manual config"
+        fi
+        
+        if [ ! -f .config ] || [ ! -s .config ]; then
+          echo "Creating manual Pi 4 configuration"
+          echo "CONFIG_TARGET_bcm27xx=y" > .config
+          echo "CONFIG_TARGET_bcm27xx_bcm2711=y" >> .config
+          echo "CONFIG_TARGET_MULTI_PROFILE=y" >> .config
+          echo "CONFIG_PACKAGE_luci=y" >> .config
+          echo "CONFIG_PACKAGE_dropbear=y" >> .config
+          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=512" >> .config
+          make defconfig
+        fi
+        
+        # Remove problematic packages
+        sed -i '/CONFIG_PACKAGE_openssh/d' .config || true
+        sed -i '/CONFIG_PACKAGE_openvpn/d' .config || true
+        sed -i '/CONFIG_PACKAGE_perl/d' .config || true
+        sed -i '/CONFIG_PACKAGE_python3-/d' .config || true
+        
+        echo "Configuration complete"
+        grep "CONFIG_TARGET" .config
     
     - name: Clean and optimize for space
       run: |
@@ -17,6 +87,10 @@ jobs:
         # Clean package downloads cache (will re-download only what's needed)
         rm -rf dl/ 2>/dev/null || true
         echo "Cleaned build directories to maximize available space"
+    
+    - name: Download dependencies
+      run: |
+        make download -j$(nproc) || make download -j1
     
     - name: Build Pi 4 OpenWrt with space management
       run: |
@@ -33,3 +107,47 @@ jobs:
         find staging_dir/ -name "*.a" -delete 2>/dev/null || true
         
         echo "Build phase completed"
+    
+    - name: Collect Pi 4 artifacts quickly
+      if: always()
+      run: |
+        mkdir -p artifacts
+        
+        # Quick artifact collection with size limits
+        if [ -d "bin/targets/bcm27xx/bcm2711" ]; then
+          echo "Found Pi 4 directory, copying essential files only"
+          find bin/targets/bcm27xx/bcm2711/ -name "*.img*" -o -name "*factory*" -o -name "*sysupgrade*" | \
+            head -10 | while read f; do
+            if [ -f "$f" ]; then
+              echo "Copying: $f"
+              cp "$f" artifacts/ 2>/dev/null || true
+            fi
+          done
+        fi
+        
+        # Copy small essential files only
+        cp build.log artifacts/ 2>/dev/null || true
+        cp build-single.log artifacts/ 2>/dev/null || true
+        head -50 .config > artifacts/config-summary.txt 2>/dev/null || true
+        
+        # Quick summary (no large listings to save space)
+        echo "Build completed for Pi 4" > artifacts/SUMMARY.txt
+        echo "Files found:" >> artifacts/SUMMARY.txt
+        ls artifacts/ >> artifacts/SUMMARY.txt 2>/dev/null || true
+        
+        echo "Artifacts collected"
+        ls artifacts/
+    
+    - name: Upload Pi 4 build artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pi4-openmanet-${{ github.run_number }}
+        path: artifacts/
+        retention-days: 30
+    
+    - name: Final summary
+      if: always()
+      run: |
+        echo "Build completed - check artifacts for Pi 4 images"
+        find artifacts/ -name "*.img*" 2>/dev/null || echo "No img files in artifacts"
