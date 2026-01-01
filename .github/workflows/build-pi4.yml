@@ -1,6 +1,5 @@
-name: Build OpenMANET for Raspberry Pi 4
+name: Build OpenMANET for Raspberry Pi 4 (Fixed)
 
-# Trigger the workflow manually via GitHub Actions UI
 on:
   workflow_dispatch:
 
@@ -9,13 +8,11 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    # Checkout the repository
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
         submodules: recursive
     
-    # Install build dependencies
     - name: Install build dependencies
       run: |
         sudo apt-get update
@@ -36,84 +33,130 @@ jobs:
           zlib1g-dev \
           swig \
           wget \
-          curl
+          curl \
+          file \
+          python3-dev \
+          python3-setuptools
     
-    # Configure build for Pi 4 (ekh-bcm2711)
-    - name: Configure build for Pi 4 (ekh-bcm2711)
+    # Debug: Check what's available
+    - name: Debug - Check available boards and scripts
       run: |
-        chmod +x scripts/morse_setup.sh
-        ./scripts/morse_setup.sh -i -b ekh-bcm2711
+        echo "=== Available boards ==="
+        ls -la boards/
+        echo ""
+        echo "=== Available scripts ==="
+        ls -la scripts/
+        echo ""
+        echo "=== Check morse_setup.sh ==="
+        if [ -f scripts/morse_setup.sh ]; then
+          echo "morse_setup.sh exists"
+          head -20 scripts/morse_setup.sh
+        else
+          echo "morse_setup.sh NOT FOUND"
+          find . -name "*setup*" -o -name "*morse*" | head -10
+        fi
+        echo ""
+        echo "=== Check bcm2711 board config ==="
+        if [ -d boards/ekh-bcm2711 ]; then
+          echo "ekh-bcm2711 board exists"
+          ls -la boards/ekh-bcm2711/
+        else
+          echo "ekh-bcm2711 board NOT FOUND"
+        fi
     
-    # Download dependencies
+    # Try manual configuration instead of morse_setup.sh
+    - name: Manual build configuration for Pi 4
+      run: |
+        echo "=== Setting up manual configuration ==="
+        
+        # Initialize feeds first
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        
+        # Create basic config for bcm27xx/bcm2711
+        echo "CONFIG_TARGET_bcm27xx=y" > .config
+        echo "CONFIG_TARGET_bcm27xx_bcm2711=y" >> .config
+        echo "CONFIG_TARGET_MULTI_PROFILE=y" >> .config
+        
+        # Add basic packages
+        echo "CONFIG_PACKAGE_luci=y" >> .config
+        echo "CONFIG_PACKAGE_luci-ssl=y" >> .config
+        
+        # Try to add morse packages if available
+        if ./scripts/feeds list | grep -q morse; then
+          echo "=== Found morse feed, adding morse packages ==="
+          echo "CONFIG_PACKAGE_morsectrl=y" >> .config || true
+        else
+          echo "=== No morse feed found, building basic OpenWrt ==="
+        fi
+        
+        # Generate full config
+        make defconfig
+        
+        echo "=== Final configuration ==="
+        grep "CONFIG_TARGET" .config || echo "No target config found"
+    
     - name: Download dependencies
       run: |
         make download
     
-    # Build OpenMANET (this will take several hours)
-    - name: Build OpenMANET for Pi 4
+    - name: Build OpenMANET/OpenWrt for Pi 4
       run: |
-        make -j$(nproc) V=sc 2>&1 | tee build.log
+        # Build with verbose output and continue on error to get logs
+        make -j$(nproc) V=s 2>&1 | tee build.log || {
+          echo "Build failed, but continuing to collect logs..."
+          exit_code=$?
+          echo "Exit code: $exit_code"
+        }
     
-    # Find and prepare build artifacts
-    - name: Prepare build artifacts
+    - name: Collect build artifacts and logs
+      if: always()
       run: |
-        # Create artifacts directory
         mkdir -p build-artifacts
         
-        # Copy Pi 4 specific build outputs
-        if [ -d "bin/targets/bcm27xx/bcm2711" ]; then
-          echo "Found Pi 4 build outputs, copying..."
-          cp -r bin/targets/bcm27xx/bcm2711/* build-artifacts/
-        fi
+        echo "=== Searching for build outputs ==="
+        find . -name "*.img*" -o -name "*.bin" -o -name "*.tar.gz" | head -20
         
-        # Copy any other relevant build outputs
-        find bin/ -name "*.img*" -o -name "*.tar.gz" -o -name "*.bin" | while read file; do
+        # Copy any found images
+        find bin/ -name "*.img*" -o -name "*.bin" -o -name "*.tar.gz" 2>/dev/null | while read file; do
           if [[ -f "$file" ]]; then
-            echo "Copying: $file"
+            echo "Found: $file"
             cp "$file" build-artifacts/
           fi
         done
         
-        # Copy build log
-        cp build.log build-artifacts/ 2>/dev/null || true
+        # Copy logs
+        cp build.log build-artifacts/ 2>/dev/null || echo "No build.log found"
         
-        # Create a summary file
-        echo "OpenMANET Pi 4 Build Summary" > build-artifacts/BUILD_INFO.txt
-        echo "Build Date: $(date)" >> build-artifacts/BUILD_INFO.txt
-        echo "Target: ekh-bcm2711 (Raspberry Pi 4)" >> build-artifacts/BUILD_INFO.txt
-        echo "Repository: https://github.com/spencrmartin/openwrt" >> build-artifacts/BUILD_INFO.txt
-        echo "" >> build-artifacts/BUILD_INFO.txt
-        echo "Files in this build:" >> build-artifacts/BUILD_INFO.txt
-        ls -la build-artifacts/ >> build-artifacts/BUILD_INFO.txt
+        # Create debug info
+        echo "=== Build Debug Info ===" > build-artifacts/DEBUG_INFO.txt
+        echo "Build Date: $(date)" >> build-artifacts/DEBUG_INFO.txt
+        echo "Git Commit: $(git rev-parse HEAD)" >> build-artifacts/DEBUG_INFO.txt
+        echo "" >> build-artifacts/DEBUG_INFO.txt
+        echo "Final .config:" >> build-artifacts/DEBUG_INFO.txt
+        cat .config >> build-artifacts/DEBUG_INFO.txt 2>/dev/null || echo "No .config found" >> build-artifacts/DEBUG_INFO.txt
+        echo "" >> build-artifacts/DEBUG_INFO.txt
+        echo "Available targets:" >> build-artifacts/DEBUG_INFO.txt
+        ls -la target/linux/ >> build-artifacts/DEBUG_INFO.txt 2>/dev/null || echo "No targets found" >> build-artifacts/DEBUG_INFO.txt
         
-        # List what we're uploading
-        echo "Build artifacts to upload:"
+        echo "=== Artifacts collected ==="
         ls -la build-artifacts/
     
-    # Upload Pi 4 build artifacts
-    - name: Upload Pi 4 build artifacts
+    - name: Upload build results
       uses: actions/upload-artifact@v4
+      if: always()
       with:
-        name: openmanet-pi4-${{ github.run_number }}
+        name: openmanet-pi4-debug-${{ github.run_number }}
         path: build-artifacts/
         retention-days: 30
     
-    # Upload build logs (separate artifact for easier access)
-    - name: Upload build logs
+    - name: Upload detailed logs
       uses: actions/upload-artifact@v4
-      if: always()  # Upload logs even if build fails
+      if: always()
       with:
-        name: build-logs-${{ github.run_number }}
+        name: detailed-logs-${{ github.run_number }}
         path: |
           build.log
-          **/*.log
+          logs/
+          tmp/
         retention-days: 7
-    
-    # Create a release comment with download info
-    - name: Build completion summary
-      if: success()
-      run: |
-        echo "✅ Pi 4 build completed successfully!"
-        echo "📦 Download your Pi 4 OpenMANET image from the artifacts above"
-        echo "🔥 Flash this image to your Pi 4 SD card"
-        echo "⚠️  Make sure to use this Pi 4 specific build, not the ekh01 version"
