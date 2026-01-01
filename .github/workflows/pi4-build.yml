@@ -1,0 +1,179 @@
+name: Build Pi4 OpenMANET
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          clang \
+          flex \
+          g++ \
+          gawk \
+          gcc-multilib \
+          g++-multilib \
+          git \
+          gettext \
+          libncurses5-dev \
+          libncurses-dev \
+          libssl-dev \
+          python3-dev \
+          python3-setuptools \
+          python3-pip \
+          rsync \
+          unzip \
+          zlib1g-dev \
+          swig \
+          wget \
+          curl \
+          file \
+          bc \
+          zip \
+          time \
+          ccache \
+          libc6-dev-i386
+        
+        # Install Python packages that replaced python3-distutils
+        python3 -m pip install --break-system-packages setuptools wheel distutils-extra || \
+        python3 -m pip install setuptools wheel distutils-extra
+    
+    - name: Debug system and repository
+      run: |
+        echo "=== System Info ==="
+        uname -a
+        python3 --version
+        echo "=== Repository Structure ==="
+        ls -la | head -10
+        echo "=== Available boards ==="
+        ls -la boards/ | head -10
+        echo "=== Check bcm2711 board ==="
+        if [ -d boards/ekh-bcm2711 ]; then
+          echo "✅ ekh-bcm2711 board exists"
+          ls -la boards/ekh-bcm2711/
+        else
+          echo "❌ ekh-bcm2711 board NOT FOUND"
+          ls -la boards/ | grep bcm
+        fi
+    
+    - name: Initialize feeds
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+    
+    - name: Configure for Pi 4
+      run: |
+        # Try morse_setup.sh first
+        if [ -f scripts/morse_setup.sh ] && [ -d boards/ekh-bcm2711 ]; then
+          echo "Trying morse_setup.sh..."
+          chmod +x scripts/morse_setup.sh
+          if ./scripts/morse_setup.sh -i -b ekh-bcm2711; then
+            echo "✅ morse_setup.sh succeeded"
+          else
+            echo "❌ morse_setup.sh failed, using manual config"
+            USE_MANUAL=1
+          fi
+        else
+          echo "Using manual configuration"
+          USE_MANUAL=1
+        fi
+        
+        if [ "$USE_MANUAL" = "1" ]; then
+          # Manual Pi 4 configuration
+          cat > .config << EOF
+CONFIG_TARGET_bcm27xx=y
+CONFIG_TARGET_bcm27xx_bcm2711=y
+CONFIG_TARGET_MULTI_PROFILE=y
+CONFIG_TARGET_ALL_PROFILES=y
+CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_luci-ssl-openssl=y
+CONFIG_TARGET_ROOTFS_PARTSIZE=512
+EOF
+          
+          # Add morse packages if available
+          if ./scripts/feeds list | grep -q morse; then
+            echo "Adding morse packages..."
+            echo "CONFIG_PACKAGE_morsectrl=y" >> .config
+          fi
+          
+          make defconfig
+        fi
+        
+        echo "=== Final config summary ==="
+        grep "CONFIG_TARGET" .config | head -5
+    
+    - name: Download dependencies
+      run: |
+        make download -j$(nproc)
+    
+    - name: Build OpenMANET for Pi 4
+      run: |
+        echo "Starting build at $(date)"
+        make -j$(nproc) V=s 2>&1 | tee build.log
+    
+    - name: Collect artifacts
+      if: always()
+      run: |
+        mkdir -p artifacts
+        
+        # Copy Pi 4 build outputs
+        if [ -d "bin/targets/bcm27xx/bcm2711" ]; then
+          echo "✅ Found Pi 4 build outputs"
+          cp -r bin/targets/bcm27xx/bcm2711/* artifacts/
+        fi
+        
+        # Copy any other images
+        find bin/ -name "*.img*" -o -name "*.tar.gz" | head -10 | while read f; do
+          [ -f "$f" ] && cp "$f" artifacts/
+        done
+        
+        # Copy logs and config
+        cp build.log artifacts/ 2>/dev/null || true
+        cp .config artifacts/final.config 2>/dev/null || true
+        
+        # Create summary
+        echo "Build completed: $(date)" > artifacts/BUILD_INFO.txt
+        echo "Target: bcm27xx/bcm2711 (Raspberry Pi 4)" >> artifacts/BUILD_INFO.txt
+        echo "Files:" >> artifacts/BUILD_INFO.txt
+        ls -la artifacts/ >> artifacts/BUILD_INFO.txt
+        
+        echo "=== Final artifacts ==="
+        ls -la artifacts/
+    
+    - name: Upload Pi 4 build
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pi4-openmanet-${{ github.run_number }}
+        path: artifacts/
+        retention-days: 30
+    
+    - name: Build summary
+      if: always()
+      run: |
+        if find artifacts/ -name "*.img*" | grep -q .; then
+          echo "🎉 SUCCESS: Pi 4 images built!"
+          echo "Download artifacts and flash to your Pi 4"
+        else
+          echo "❌ No images found - check logs"
+        fi
