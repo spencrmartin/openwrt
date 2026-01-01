@@ -1,0 +1,119 @@
+name: Build OpenMANET for Raspberry Pi 4
+
+# Trigger the workflow manually via GitHub Actions UI
+on:
+  workflow_dispatch:
+
+jobs:
+  build-openmanet-rpi4:
+    runs-on: ubuntu-latest
+    
+    steps:
+    # Checkout the repository
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    # Install build dependencies
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          clang \
+          flex \
+          g++ \
+          gawk \
+          gcc-multilib \
+          git \
+          gettext \
+          libncurses5-dev \
+          libssl-dev \
+          python3-distutils \
+          rsync \
+          unzip \
+          zlib1g-dev \
+          swig \
+          wget \
+          curl
+    
+    # Configure build for Pi 4 (ekh-bcm2711)
+    - name: Configure build for Pi 4 (ekh-bcm2711)
+      run: |
+        chmod +x scripts/morse_setup.sh
+        ./scripts/morse_setup.sh -i -b ekh-bcm2711
+    
+    # Download dependencies
+    - name: Download dependencies
+      run: |
+        make download
+    
+    # Build OpenMANET (this will take several hours)
+    - name: Build OpenMANET for Pi 4
+      run: |
+        make -j$(nproc) V=sc 2>&1 | tee build.log
+    
+    # Find and prepare build artifacts
+    - name: Prepare build artifacts
+      run: |
+        # Create artifacts directory
+        mkdir -p build-artifacts
+        
+        # Copy Pi 4 specific build outputs
+        if [ -d "bin/targets/bcm27xx/bcm2711" ]; then
+          echo "Found Pi 4 build outputs, copying..."
+          cp -r bin/targets/bcm27xx/bcm2711/* build-artifacts/
+        fi
+        
+        # Copy any other relevant build outputs
+        find bin/ -name "*.img*" -o -name "*.tar.gz" -o -name "*.bin" | while read file; do
+          if [[ -f "$file" ]]; then
+            echo "Copying: $file"
+            cp "$file" build-artifacts/
+          fi
+        done
+        
+        # Copy build log
+        cp build.log build-artifacts/ 2>/dev/null || true
+        
+        # Create a summary file
+        echo "OpenMANET Pi 4 Build Summary" > build-artifacts/BUILD_INFO.txt
+        echo "Build Date: $(date)" >> build-artifacts/BUILD_INFO.txt
+        echo "Target: ekh-bcm2711 (Raspberry Pi 4)" >> build-artifacts/BUILD_INFO.txt
+        echo "Repository: https://github.com/spencrmartin/openwrt" >> build-artifacts/BUILD_INFO.txt
+        echo "" >> build-artifacts/BUILD_INFO.txt
+        echo "Files in this build:" >> build-artifacts/BUILD_INFO.txt
+        ls -la build-artifacts/ >> build-artifacts/BUILD_INFO.txt
+        
+        # List what we're uploading
+        echo "Build artifacts to upload:"
+        ls -la build-artifacts/
+    
+    # Upload Pi 4 build artifacts
+    - name: Upload Pi 4 build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: openmanet-pi4-${{ github.run_number }}
+        path: build-artifacts/
+        retention-days: 30
+    
+    # Upload build logs (separate artifact for easier access)
+    - name: Upload build logs
+      uses: actions/upload-artifact@v4
+      if: always()  # Upload logs even if build fails
+      with:
+        name: build-logs-${{ github.run_number }}
+        path: |
+          build.log
+          **/*.log
+        retention-days: 7
+    
+    # Create a release comment with download info
+    - name: Build completion summary
+      if: success()
+      run: |
+        echo "✅ Pi 4 build completed successfully!"
+        echo "📦 Download your Pi 4 OpenMANET image from the artifacts above"
+        echo "🔥 Flash this image to your Pi 4 SD card"
+        echo "⚠️  Make sure to use this Pi 4 specific build, not the ekh01 version"
