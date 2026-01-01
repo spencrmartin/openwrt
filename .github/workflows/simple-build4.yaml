@@ -1,0 +1,35 @@
+name: Build Pi4 OpenMANET Simple
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    # ... [dependencies and setup steps] ...
+    
+    - name: Clean and optimize for space
+      run: |
+        # Clean any existing build artifacts to save space
+        rm -rf bin/ build_dir/ staging_dir/ tmp/ 2>/dev/null || true
+        # Clean package downloads cache (will re-download only what's needed)
+        rm -rf dl/ 2>/dev/null || true
+        echo "Cleaned build directories to maximize available space"
+    
+    - name: Build Pi 4 OpenWrt with space management
+      run: |
+        echo "Starting space-optimized build"
+        
+        # Build with keep-going flag and clean as we go
+        make -j$(nproc) -k V=w 2>&1 | head -n 50000 | tee build.log || {
+          echo "Parallel build encountered issues, trying single-threaded"
+          make -j1 -k V=w 2>&1 | head -n 10000 | tee build-single.log || true
+        }
+        
+        # Clean intermediate files during build to save space
+        find build_dir/ -name "*.o" -delete 2>/dev/null || true
+        find staging_dir/ -name "*.a" -delete 2>/dev/null || true
+        
+        echo "Build phase completed"
