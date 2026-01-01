@@ -1,4 +1,4 @@
-name: Build OpenMANET for Raspberry Pi 4 (Fixed)
+name: Build OpenMANET for Raspberry Pi 4 (Ubuntu 24.04 Fix)
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ jobs:
       with:
         submodules: recursive
     
-    - name: Install build dependencies
+    - name: Install build dependencies (Ubuntu 24.04 compatible)
       run: |
         sudo apt-get update
         sudo apt-get install -y \
@@ -23,11 +23,15 @@ jobs:
           g++ \
           gawk \
           gcc-multilib \
+          g++-multilib \
           git \
           gettext \
           libncurses5-dev \
+          libncurses-dev \
           libssl-dev \
-          python3-distutils \
+          python3-dev \
+          python3-setuptools \
+          python3-pip \
           rsync \
           unzip \
           zlib1g-dev \
@@ -35,17 +39,28 @@ jobs:
           wget \
           curl \
           file \
-          python3-dev \
-          python3-setuptools
+          bc \
+          zip \
+          time \
+          ccache \
+          libc6-dev-i386
+        
+        # Install Python packages that replaced python3-distutils
+        python3 -m pip install --break-system-packages setuptools wheel distutils-extra || \
+        python3 -m pip install setuptools wheel distutils-extra
     
     # Debug: Check what's available
     - name: Debug - Check available boards and scripts
       run: |
+        echo "=== System Info ==="
+        uname -a
+        python3 --version
+        echo ""
         echo "=== Available boards ==="
-        ls -la boards/
+        ls -la boards/ | head -20
         echo ""
         echo "=== Available scripts ==="
-        ls -la scripts/
+        ls -la scripts/ | head -10
         echo ""
         echo "=== Check morse_setup.sh ==="
         if [ -f scripts/morse_setup.sh ]; then
@@ -60,64 +75,133 @@ jobs:
         if [ -d boards/ekh-bcm2711 ]; then
           echo "ekh-bcm2711 board exists"
           ls -la boards/ekh-bcm2711/
+          echo "Contents of target_diffconfig:"
+          cat boards/ekh-bcm2711/target_diffconfig
         else
           echo "ekh-bcm2711 board NOT FOUND"
+          echo "Available bcm boards:"
+          ls -la boards/ | grep bcm
         fi
+        echo ""
+        echo "=== Check target/linux structure ==="
+        ls -la target/linux/ | grep bcm
     
-    # Try manual configuration instead of morse_setup.sh
-    - name: Manual build configuration for Pi 4
+    # Initialize feeds and check what's available
+    - name: Initialize and check feeds
       run: |
-        echo "=== Setting up manual configuration ==="
-        
-        # Initialize feeds first
+        echo "=== Updating feeds ==="
         ./scripts/feeds update -a
+        echo ""
+        echo "=== Available feeds ==="
+        ./scripts/feeds list | head -20
+        echo ""
+        echo "=== Looking for morse packages ==="
+        ./scripts/feeds list | grep -i morse || echo "No morse packages found"
+        echo ""
+        echo "=== Installing all feeds ==="
         ./scripts/feeds install -a
-        
-        # Create basic config for bcm27xx/bcm2711
-        echo "CONFIG_TARGET_bcm27xx=y" > .config
-        echo "CONFIG_TARGET_bcm27xx_bcm2711=y" >> .config
-        echo "CONFIG_TARGET_MULTI_PROFILE=y" >> .config
-        
-        # Add basic packages
-        echo "CONFIG_PACKAGE_luci=y" >> .config
-        echo "CONFIG_PACKAGE_luci-ssl=y" >> .config
-        
-        # Try to add morse packages if available
-        if ./scripts/feeds list | grep -q morse; then
-          echo "=== Found morse feed, adding morse packages ==="
-          echo "CONFIG_PACKAGE_morsectrl=y" >> .config || true
+    
+    # Try the original morse_setup.sh first, fall back to manual config
+    - name: Configure build for Pi 4
+      run: |
+        if [ -f scripts/morse_setup.sh ] && [ -d boards/ekh-bcm2711 ]; then
+          echo "=== Trying morse_setup.sh approach ==="
+          chmod +x scripts/morse_setup.sh
+          if ./scripts/morse_setup.sh -i -b ekh-bcm2711; then
+            echo "morse_setup.sh succeeded!"
+            echo "Current config:"
+            head -20 .config
+          else
+            echo "morse_setup.sh failed, trying manual approach..."
+            SETUP_FAILED=1
+          fi
         else
-          echo "=== No morse feed found, building basic OpenWrt ==="
+          echo "=== morse_setup.sh or ekh-bcm2711 not found, using manual approach ==="
+          SETUP_FAILED=1
         fi
         
-        # Generate full config
-        make defconfig
+        if [ "${SETUP_FAILED}" = "1" ]; then
+          echo "=== Manual configuration for Pi 4 ==="
+          
+          # Create basic config for bcm27xx/bcm2711
+          cat > .config << EOF
+CONFIG_TARGET_bcm27xx=y
+CONFIG_TARGET_bcm27xx_bcm2711=y
+CONFIG_TARGET_MULTI_PROFILE=y
+CONFIG_TARGET_ALL_PROFILES=y
+
+# Basic packages
+CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_luci-ssl-openssl=y
+CONFIG_PACKAGE_wpad-openssl=y
+
+# Pi 4 specific
+CONFIG_TARGET_ROOTFS_PARTSIZE=512
+
+# Development tools
+CONFIG_PACKAGE_openssh-sftp-server=y
+CONFIG_PACKAGE_nano=y
+CONFIG_PACKAGE_htop=y
+EOF
+          
+          # Try to add morse packages if available
+          if ./scripts/feeds list | grep -q morse; then
+            echo "=== Adding morse packages ==="
+            cat >> .config << EOF
+            
+# Morse packages
+CONFIG_PACKAGE_morsectrl=y
+CONFIG_PACKAGE_morse-fw-6108-tlm=y
+EOF
+          fi
+          
+          # Generate full config
+          make defconfig
+        fi
         
-        echo "=== Final configuration ==="
-        grep "CONFIG_TARGET" .config || echo "No target config found"
+        echo "=== Final configuration summary ==="
+        grep "CONFIG_TARGET" .config | head -10
+        echo "Config file size: $(wc -l < .config) lines"
     
     - name: Download dependencies
       run: |
-        make download
+        echo "=== Downloading build dependencies ==="
+        make download -j$(nproc)
     
-    - name: Build OpenMANET/OpenWrt for Pi 4
+    - name: Build OpenWrt for Pi 4
       run: |
-        # Build with verbose output and continue on error to get logs
-        make -j$(nproc) V=s 2>&1 | tee build.log || {
-          echo "Build failed, but continuing to collect logs..."
-          exit_code=$?
-          echo "Exit code: $exit_code"
-        }
+        echo "=== Starting build at $(date) ==="
+        echo "Using $(nproc) CPU cores"
+        
+        # Build with verbose output, but capture exit code
+        if make -j$(nproc) V=s 2>&1 | tee build.log; then
+          echo "=== Build completed successfully at $(date) ==="
+        else
+          BUILD_EXIT_CODE=$?
+          echo "=== Build failed with exit code $BUILD_EXIT_CODE at $(date) ==="
+          echo "Continuing to collect artifacts..."
+        fi
     
     - name: Collect build artifacts and logs
       if: always()
       run: |
         mkdir -p build-artifacts
         
-        echo "=== Searching for build outputs ==="
-        find . -name "*.img*" -o -name "*.bin" -o -name "*.tar.gz" | head -20
+        echo "=== Searching for Pi 4 build outputs ==="
         
-        # Copy any found images
+        # Look specifically for Pi 4 outputs
+        if [ -d "bin/targets/bcm27xx/bcm2711" ]; then
+          echo "Found Pi 4 build directory!"
+          ls -la bin/targets/bcm27xx/bcm2711/
+          cp -r bin/targets/bcm27xx/bcm2711/* build-artifacts/
+        else
+          echo "No Pi 4 specific build directory found"
+          echo "Available target directories:"
+          find bin/targets/ -type d 2>/dev/null | head -10
+        fi
+        
+        # Look for any images anywhere
+        echo "=== Searching for any build outputs ==="
         find bin/ -name "*.img*" -o -name "*.bin" -o -name "*.tar.gz" 2>/dev/null | while read file; do
           if [[ -f "$file" ]]; then
             echo "Found: $file"
@@ -128,25 +212,38 @@ jobs:
         # Copy logs
         cp build.log build-artifacts/ 2>/dev/null || echo "No build.log found"
         
-        # Create debug info
-        echo "=== Build Debug Info ===" > build-artifacts/DEBUG_INFO.txt
-        echo "Build Date: $(date)" >> build-artifacts/DEBUG_INFO.txt
-        echo "Git Commit: $(git rev-parse HEAD)" >> build-artifacts/DEBUG_INFO.txt
-        echo "" >> build-artifacts/DEBUG_INFO.txt
-        echo "Final .config:" >> build-artifacts/DEBUG_INFO.txt
-        cat .config >> build-artifacts/DEBUG_INFO.txt 2>/dev/null || echo "No .config found" >> build-artifacts/DEBUG_INFO.txt
-        echo "" >> build-artifacts/DEBUG_INFO.txt
-        echo "Available targets:" >> build-artifacts/DEBUG_INFO.txt
-        ls -la target/linux/ >> build-artifacts/DEBUG_INFO.txt 2>/dev/null || echo "No targets found" >> build-artifacts/DEBUG_INFO.txt
+        # Copy config
+        cp .config build-artifacts/final.config 2>/dev/null || echo "No .config found"
         
-        echo "=== Artifacts collected ==="
+        # Create comprehensive debug info
+        cat > build-artifacts/BUILD_SUMMARY.txt << EOF
+=== OpenMANET Pi 4 Build Summary ===
+Build Date: $(date)
+Git Commit: $(git rev-parse HEAD)
+Build Host: $(uname -a)
+Target: bcm27xx/bcm2711 (Raspberry Pi 4)
+
+=== Build Results ===
+$(if [ -d "bin/targets/bcm27xx/bcm2711" ]; then echo "✅ Pi 4 build directory exists"; else echo "❌ No Pi 4 build directory"; fi)
+$(find build-artifacts/ -name "*.img*" | wc -l) image files found
+$(find build-artifacts/ -name "*.tar.gz" | wc -l) tarball files found
+
+=== Files in this build ===
+$(ls -la build-artifacts/)
+
+=== Final .config (first 50 lines) ===
+$(head -50 .config 2>/dev/null || echo "No .config available")
+EOF
+        
+        echo "=== Final artifacts ==="
         ls -la build-artifacts/
+        du -sh build-artifacts/
     
-    - name: Upload build results
+    - name: Upload Pi 4 build artifacts
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: openmanet-pi4-debug-${{ github.run_number }}
+        name: openmanet-pi4-build-${{ github.run_number }}
         path: build-artifacts/
         retention-days: 30
     
@@ -154,9 +251,25 @@ jobs:
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: detailed-logs-${{ github.run_number }}
+        name: build-logs-detailed-${{ github.run_number }}
         path: |
           build.log
           logs/
-          tmp/
         retention-days: 7
+    
+    - name: Build status summary
+      if: always()
+      run: |
+        if [ -f build-artifacts/BUILD_SUMMARY.txt ]; then
+          echo "=== BUILD SUMMARY ==="
+          cat build-artifacts/BUILD_SUMMARY.txt
+        fi
+        
+        if find build-artifacts/ -name "*.img*" | grep -q .; then
+          echo ""
+          echo "🎉 SUCCESS: Pi 4 images found!"
+          echo "📦 Download the artifacts above and flash to your Pi 4"
+        else
+          echo ""
+          echo "⚠️  No images found, but logs collected for debugging"
+        fi
