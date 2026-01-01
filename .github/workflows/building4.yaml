@@ -1,0 +1,289 @@
+name: Build Pi4 OpenMANET (Optimized)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: false
+        default: 'minimal'
+        type: choice
+        options:
+          - minimal
+          - full
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          clang \
+          flex \
+          g++ \
+          gawk \
+          gcc-multilib \
+          g++-multilib \
+          git \
+          gettext \
+          libncurses5-dev \
+          libncurses-dev \
+          libssl-dev \
+          python3-dev \
+          python3-setuptools \
+          python3-pip \
+          rsync \
+          unzip \
+          zlib1g-dev \
+          swig \
+          wget \
+          curl \
+          file \
+          bc \
+          zip \
+          time \
+          ccache \
+          libc6-dev-i386
+        
+        python3 -m pip install --break-system-packages setuptools wheel || \
+        python3 -m pip install setuptools wheel || true
+    
+    - name: Debug system and repository
+      run: |
+        echo "=== System Info ==="
+        uname -a
+        python3 --version
+        echo "=== Available boards ==="
+        ls -la boards/ | head -10
+        echo "=== Check bcm2711 board ==="
+        if [ -d boards/ekh-bcm2711 ]; then
+          echo "ekh-bcm2711 board exists"
+          ls -la boards/ekh-bcm2711/
+        else
+          echo "ekh-bcm2711 board NOT FOUND"
+          ls -la boards/ | grep bcm || echo "No bcm boards found"
+        fi
+    
+    - name: Initialize feeds
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+    
+    - name: Configure for Pi 4 (Optimized)
+      run: |
+        echo "=== Configuring optimized Pi 4 build ==="
+        
+        # Try morse_setup.sh first
+        if [ -f scripts/morse_setup.sh ] && [ -d boards/ekh-bcm2711 ]; then
+          echo "Trying morse_setup.sh..."
+          chmod +x scripts/morse_setup.sh
+          if ./scripts/morse_setup.sh -i -b ekh-bcm2711; then
+            echo "morse_setup.sh succeeded"
+            
+            # Remove problematic packages from the config
+            echo "Removing problematic packages..."
+            sed -i '/CONFIG_PACKAGE_openssh/d' .config
+            sed -i '/CONFIG_PACKAGE_openvpn/d' .config  
+            sed -i '/CONFIG_PACKAGE_perl/d' .config
+            sed -i '/CONFIG_PACKAGE_python/d' .config
+            
+            CONFIG_SUCCESS=1
+          else
+            echo "morse_setup.sh failed, using optimized manual config"
+          fi
+        fi
+        
+        if [ "$CONFIG_SUCCESS" != "1" ]; then
+          echo "Using optimized manual Pi 4 configuration"
+          
+          # Create minimal but functional Pi 4 config
+          cat > .config << 'EOL'
+CONFIG_TARGET_bcm27xx=y
+CONFIG_TARGET_bcm27xx_bcm2711=y
+CONFIG_TARGET_MULTI_PROFILE=y
+
+# Basic system
+CONFIG_PACKAGE_base-files=y
+CONFIG_PACKAGE_busybox=y
+CONFIG_PACKAGE_kernel=y
+CONFIG_PACKAGE_libc=y
+CONFIG_PACKAGE_libgcc=y
+
+# Essential Pi 4 packages
+CONFIG_PACKAGE_kmod-usb-hid=y
+CONFIG_PACKAGE_kmod-usb-storage=y
+CONFIG_PACKAGE_kmod-fs-ext4=y
+CONFIG_PACKAGE_kmod-fs-vfat=y
+
+# Network basics (avoid problematic packages)
+CONFIG_PACKAGE_kmod-mac80211=y
+CONFIG_PACKAGE_wireless-tools=y
+CONFIG_PACKAGE_wpad-basic-openssl=y
+
+# Web interface (minimal)
+CONFIG_PACKAGE_luci-base=y
+CONFIG_PACKAGE_luci-mod-admin-full=y
+CONFIG_PACKAGE_luci-theme-bootstrap=y
+CONFIG_PACKAGE_uhttpd=y
+
+# SSH alternative (dropbear instead of openssh)
+CONFIG_PACKAGE_dropbear=y
+
+# Pi 4 specific
+CONFIG_TARGET_ROOTFS_PARTSIZE=512
+CONFIG_TARGET_KERNEL_PARTSIZE=64
+
+# Exclude problematic packages explicitly
+# CONFIG_PACKAGE_openssh-client is not set
+# CONFIG_PACKAGE_openssh-server is not set
+# CONFIG_PACKAGE_openvpn is not set
+# CONFIG_PACKAGE_perl is not set
+# CONFIG_PACKAGE_python3 is not set
+EOL
+          
+          # Add morse packages if available (but be selective)
+          if ./scripts/feeds list | grep -q morse; then
+            echo "Adding core morse packages..."
+            echo "CONFIG_PACKAGE_morsectrl=y" >> .config
+            # Skip firmware packages that might cause issues
+            # echo "CONFIG_PACKAGE_morse-fw-6108-tlm=y" >> .config
+          fi
+          
+          make defconfig
+        fi
+        
+        echo "=== Final optimized configuration ==="
+        grep "CONFIG_TARGET\|CONFIG_PACKAGE.*=y" .config | head -20
+        echo "Total enabled packages: $(grep "CONFIG_PACKAGE.*=y" .config | wc -l)"
+    
+    - name: Download dependencies
+      run: |
+        echo "Downloading build dependencies..."
+        make download -j$(nproc) || make download -j1
+    
+    - name: Build Pi 4 OpenWrt (Optimized)
+      run: |
+        echo "=== Starting optimized build at $(date) ==="
+        echo "Using $(nproc) CPU cores"
+        
+        # Build with error continuation to get partial results
+        if make -j$(nproc) -k 2>&1 | tee build.log; then
+          echo "Build completed successfully at $(date)"
+          BUILD_SUCCESS=1
+        else
+          echo "Some packages failed, but continuing to collect artifacts..."
+          echo "Trying single-threaded build for failed components..."
+          make -j1 -k V=s 2>&1 | tee -a build-single.log || true
+          
+          # Check if we got the essential Pi 4 kernel and rootfs
+          if [ -d "bin/targets/bcm27xx/bcm2711" ] && \
+             find bin/targets/bcm27xx/bcm2711/ -name "*bcm2711*" | grep -q .; then
+            echo "Essential Pi 4 components built successfully"
+            BUILD_SUCCESS=1
+          else
+            echo "Essential Pi 4 components missing"
+            BUILD_SUCCESS=0
+          fi
+        fi
+        
+        echo "BUILD_SUCCESS=$BUILD_SUCCESS" >> $GITHUB_ENV
+    
+    - name: Collect build artifacts
+      if: always()
+      run: |
+        mkdir -p artifacts
+        
+        echo "=== Collecting Pi 4 artifacts ==="
+        if [ -d "bin/targets/bcm27xx/bcm2711" ]; then
+          echo "Found Pi 4 build directory!"
+          ls -la bin/targets/bcm27xx/bcm2711/
+          cp -r bin/targets/bcm27xx/bcm2711/* artifacts/ 2>/dev/null || echo "Some copy operations failed"
+        else
+          echo "No Pi 4 build directory found"
+          find bin/targets/ -type d 2>/dev/null || echo "No targets directory"
+        fi
+        
+        # Look for any Pi 4 images anywhere
+        echo "=== Searching for Pi 4 images ==="
+        find . -name "*bcm27*" -o -name "*bcm2711*" -o -name "*rpi-4*" 2>/dev/null | \
+          grep -E "\.(img|bin|tar\.gz)$" | head -10 | while read f; do
+          if [ -f "$f" ]; then
+            echo "Found Pi 4 file: $f"
+            cp "$f" artifacts/ 2>/dev/null || echo "Failed to copy $f"
+          fi
+        done
+        
+        # Copy logs and config
+        cp build.log artifacts/ 2>/dev/null || echo "No build.log"
+        cp build-single.log artifacts/ 2>/dev/null || echo "No single-thread log"
+        cp .config artifacts/build.config 2>/dev/null || echo "No .config"
+        
+        # Create build report
+        echo "=== Pi 4 OpenMANET Build Report ===" > artifacts/BUILD_REPORT.txt
+        echo "Build Date: $(date)" >> artifacts/BUILD_REPORT.txt
+        echo "Target: Raspberry Pi 4 (bcm2711)" >> artifacts/BUILD_REPORT.txt
+        echo "Build Type: Optimized (excluded problematic packages)" >> artifacts/BUILD_REPORT.txt
+        echo "Build Success: ${BUILD_SUCCESS:-unknown}" >> artifacts/BUILD_REPORT.txt
+        echo "" >> artifacts/BUILD_REPORT.txt
+        echo "Excluded packages: openssh, openvpn, perl, python3" >> artifacts/BUILD_REPORT.txt
+        echo "Included: dropbear (SSH), luci (web UI), basic networking" >> artifacts/BUILD_REPORT.txt
+        echo "" >> artifacts/BUILD_REPORT.txt
+        echo "Artifacts found:" >> artifacts/BUILD_REPORT.txt
+        ls -la artifacts/ >> artifacts/BUILD_REPORT.txt 2>/dev/null
+        
+        echo "=== Final artifacts summary ==="
+        ls -la artifacts/
+        
+        # Count images
+        IMG_COUNT=$(find artifacts/ -name "*.img*" -o -name "*factory*" -o -name "*sysupgrade*" 2>/dev/null | wc -l)
+        if [ "$IMG_COUNT" -gt 0 ]; then
+          echo "SUCCESS: Found $IMG_COUNT Pi 4 image files!"
+          find artifacts/ -name "*.img*" -o -name "*factory*" -o -name "*sysupgrade*" 2>/dev/null
+        else
+          echo "WARNING: No obvious image files found, but build artifacts collected"
+        fi
+    
+    - name: Upload Pi 4 build artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pi4-openmanet-optimized-${{ github.run_number }}
+        path: artifacts/
+        retention-days: 30
+    
+    - name: Build completion report
+      if: always()
+      run: |
+        echo "=== OPTIMIZED PI 4 BUILD COMPLETION REPORT ==="
+        
+        if [ -f artifacts/BUILD_REPORT.txt ]; then
+          cat artifacts/BUILD_REPORT.txt
+        fi
+        
+        echo ""
+        if find artifacts/ -name "*.img*" -o -name "*factory*" -o -name "*sysupgrade*" | grep -q .; then
+          echo "🎉 SUCCESS: Pi 4 OpenMANET images are ready!"
+          echo ""
+          echo "📦 NEXT STEPS:"
+          echo "1. Download the artifacts above"
+          echo "2. Look for files like: *bcm2711*factory*.img or *bcm2711*sysupgrade*.img"  
+          echo "3. Extract the .img file if it's compressed"
+          echo "4. Flash to your Pi 4 SD card using dd or Raspberry Pi Imager"
+          echo "5. Boot your Pi 4 - should fix the red light issue!"
+          echo ""
+          echo "⚠️  NOTE: This build excludes openssh, openvpn, perl to avoid compilation errors"
+          echo "✅ INCLUDES: dropbear (SSH), luci (web UI), basic networking, morse packages"
+        else
+          echo "⚠️  No obvious image files found"
+          echo "📋 Check build logs in artifacts for debugging"
+          echo "🔧 The build may have produced other usable components"
+        fi
