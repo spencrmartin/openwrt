@@ -54,7 +54,6 @@ jobs:
           ccache \
           libc6-dev-i386
         
-        # Install Python packages that replaced python3-distutils
         python3 -m pip install --break-system-packages setuptools wheel distutils-extra || \
         python3 -m pip install setuptools wheel distutils-extra
     
@@ -69,10 +68,10 @@ jobs:
         ls -la boards/ | head -10
         echo "=== Check bcm2711 board ==="
         if [ -d boards/ekh-bcm2711 ]; then
-          echo "✅ ekh-bcm2711 board exists"
+          echo "ekh-bcm2711 board exists"
           ls -la boards/ekh-bcm2711/
         else
-          echo "❌ ekh-bcm2711 board NOT FOUND"
+          echo "ekh-bcm2711 board NOT FOUND"
           ls -la boards/ | grep bcm
         fi
     
@@ -83,14 +82,13 @@ jobs:
     
     - name: Configure for Pi 4
       run: |
-        # Try morse_setup.sh first
         if [ -f scripts/morse_setup.sh ] && [ -d boards/ekh-bcm2711 ]; then
           echo "Trying morse_setup.sh..."
           chmod +x scripts/morse_setup.sh
           if ./scripts/morse_setup.sh -i -b ekh-bcm2711; then
-            echo "✅ morse_setup.sh succeeded"
+            echo "morse_setup.sh succeeded"
           else
-            echo "❌ morse_setup.sh failed, using manual config"
+            echo "morse_setup.sh failed, using manual config"
             USE_MANUAL=1
           fi
         else
@@ -99,18 +97,14 @@ jobs:
         fi
         
         if [ "$USE_MANUAL" = "1" ]; then
-          # Manual Pi 4 configuration
-          cat > .config << EOF
-CONFIG_TARGET_bcm27xx=y
-CONFIG_TARGET_bcm27xx_bcm2711=y
-CONFIG_TARGET_MULTI_PROFILE=y
-CONFIG_TARGET_ALL_PROFILES=y
-CONFIG_PACKAGE_luci=y
-CONFIG_PACKAGE_luci-ssl-openssl=y
-CONFIG_TARGET_ROOTFS_PARTSIZE=512
-EOF
+          echo "CONFIG_TARGET_bcm27xx=y" > .config
+          echo "CONFIG_TARGET_bcm27xx_bcm2711=y" >> .config
+          echo "CONFIG_TARGET_MULTI_PROFILE=y" >> .config
+          echo "CONFIG_TARGET_ALL_PROFILES=y" >> .config
+          echo "CONFIG_PACKAGE_luci=y" >> .config
+          echo "CONFIG_PACKAGE_luci-ssl-openssl=y" >> .config
+          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=512" >> .config
           
-          # Add morse packages if available
           if ./scripts/feeds list | grep -q morse; then
             echo "Adding morse packages..."
             echo "CONFIG_PACKAGE_morsectrl=y" >> .config
@@ -136,22 +130,18 @@ EOF
       run: |
         mkdir -p artifacts
         
-        # Copy Pi 4 build outputs
         if [ -d "bin/targets/bcm27xx/bcm2711" ]; then
-          echo "✅ Found Pi 4 build outputs"
+          echo "Found Pi 4 build outputs"
           cp -r bin/targets/bcm27xx/bcm2711/* artifacts/
         fi
         
-        # Copy any other images
         find bin/ -name "*.img*" -o -name "*.tar.gz" | head -10 | while read f; do
           [ -f "$f" ] && cp "$f" artifacts/
         done
         
-        # Copy logs and config
         cp build.log artifacts/ 2>/dev/null || true
         cp .config artifacts/final.config 2>/dev/null || true
         
-        # Create summary
         echo "Build completed: $(date)" > artifacts/BUILD_INFO.txt
         echo "Target: bcm27xx/bcm2711 (Raspberry Pi 4)" >> artifacts/BUILD_INFO.txt
         echo "Files:" >> artifacts/BUILD_INFO.txt
@@ -172,8 +162,8 @@ EOF
       if: always()
       run: |
         if find artifacts/ -name "*.img*" | grep -q .; then
-          echo "🎉 SUCCESS: Pi 4 images built!"
+          echo "SUCCESS: Pi 4 images built!"
           echo "Download artifacts and flash to your Pi 4"
         else
-          echo "❌ No images found - check logs"
+          echo "No images found - check logs"
         fi
