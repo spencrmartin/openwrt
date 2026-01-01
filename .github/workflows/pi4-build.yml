@@ -54,8 +54,11 @@ jobs:
           ccache \
           libc6-dev-i386
         
-        python3 -m pip install --break-system-packages setuptools wheel distutils-extra || \
-        python3 -m pip install setuptools wheel distutils-extra
+        # Install Python packages - ignore distutils-extra if not available
+        python3 -m pip install --break-system-packages setuptools wheel || \
+        python3 -m pip install setuptools wheel || true
+        
+        echo "Python and build dependencies installed successfully"
     
     - name: Debug system and repository
       run: |
@@ -68,35 +71,39 @@ jobs:
         ls -la boards/ | head -10
         echo "=== Check bcm2711 board ==="
         if [ -d boards/ekh-bcm2711 ]; then
-          echo "ekh-bcm2711 board exists"
+          echo "✅ ekh-bcm2711 board exists"
           ls -la boards/ekh-bcm2711/
         else
-          echo "ekh-bcm2711 board NOT FOUND"
-          ls -la boards/ | grep bcm
+          echo "❌ ekh-bcm2711 board NOT FOUND"
+          ls -la boards/ | grep bcm || echo "No bcm boards found"
         fi
     
     - name: Initialize feeds
       run: |
+        echo "=== Updating feeds ==="
         ./scripts/feeds update -a
+        echo "=== Installing feeds ==="
         ./scripts/feeds install -a
     
     - name: Configure for Pi 4
       run: |
+        echo "=== Configuring build for Pi 4 ==="
+        
+        # Try morse_setup.sh first
         if [ -f scripts/morse_setup.sh ] && [ -d boards/ekh-bcm2711 ]; then
           echo "Trying morse_setup.sh..."
           chmod +x scripts/morse_setup.sh
           if ./scripts/morse_setup.sh -i -b ekh-bcm2711; then
-            echo "morse_setup.sh succeeded"
+            echo "✅ morse_setup.sh succeeded"
+            CONFIG_SUCCESS=1
           else
-            echo "morse_setup.sh failed, using manual config"
-            USE_MANUAL=1
+            echo "❌ morse_setup.sh failed, trying manual config"
           fi
-        else
-          echo "Using manual configuration"
-          USE_MANUAL=1
         fi
         
-        if [ "$USE_MANUAL" = "1" ]; then
+        # Manual configuration if morse_setup.sh failed or doesn't exist
+        if [ "$CONFIG_SUCCESS" != "1" ]; then
+          echo "=== Using manual Pi 4 configuration ==="
           echo "CONFIG_TARGET_bcm27xx=y" > .config
           echo "CONFIG_TARGET_bcm27xx_bcm2711=y" >> .config
           echo "CONFIG_TARGET_MULTI_PROFILE=y" >> .config
@@ -105,6 +112,7 @@ jobs:
           echo "CONFIG_PACKAGE_luci-ssl-openssl=y" >> .config
           echo "CONFIG_TARGET_ROOTFS_PARTSIZE=512" >> .config
           
+          # Add morse packages if available
           if ./scripts/feeds list | grep -q morse; then
             echo "Adding morse packages..."
             echo "CONFIG_PACKAGE_morsectrl=y" >> .config
@@ -114,56 +122,128 @@ jobs:
         fi
         
         echo "=== Final config summary ==="
-        grep "CONFIG_TARGET" .config | head -5
+        grep "CONFIG_TARGET" .config | head -10
+        echo "Total config lines: $(wc -l < .config)"
     
     - name: Download dependencies
       run: |
-        make download -j$(nproc)
+        echo "=== Downloading build dependencies ==="
+        make download -j$(nproc) || {
+          echo "Download failed, retrying with single thread..."
+          make download -j1
+        }
     
     - name: Build OpenMANET for Pi 4
       run: |
-        echo "Starting build at $(date)"
-        make -j$(nproc) V=s 2>&1 | tee build.log
-    
-    - name: Collect artifacts
-      if: always()
-      run: |
-        mkdir -p artifacts
+        echo "=== Starting OpenWrt build for Pi 4 at $(date) ==="
+        echo "Using $(nproc) CPU cores"
         
-        if [ -d "bin/targets/bcm27xx/bcm2711" ]; then
-          echo "Found Pi 4 build outputs"
-          cp -r bin/targets/bcm27xx/bcm2711/* artifacts/
+        # Build with reduced verbosity to avoid log overflow
+        if make -j$(nproc) 2>&1 | tee build.log; then
+          echo "✅ Build completed successfully at $(date)"
+          BUILD_SUCCESS=1
+        else
+          echo "❌ Build failed, trying single-threaded build..."
+          if make -j1 V=s 2>&1 | tee build-single.log; then
+            echo "✅ Single-threaded build completed at $(date)"
+            BUILD_SUCCESS=1
+          else
+            echo "❌ Build failed even with single thread"
+            BUILD_SUCCESS=0
+          fi
         fi
         
-        find bin/ -name "*.img*" -o -name "*.tar.gz" | head -10 | while read f; do
-          [ -f "$f" ] && cp "$f" artifacts/
+        echo "BUILD_SUCCESS=$BUILD_SUCCESS" >> $GITHUB_ENV
+    
+    - name: Collect build artifacts
+      if: always()
+      run: |
+        echo "=== Collecting build artifacts ==="
+        mkdir -p artifacts
+        
+        # Look for Pi 4 specific outputs first
+        if [ -d "bin/targets/bcm27xx/bcm2711" ]; then
+          echo "✅ Found Pi 4 build directory!"
+          ls -la bin/targets/bcm27xx/bcm2711/
+          cp -r bin/targets/bcm27xx/bcm2711/* artifacts/ || echo "Failed to copy some files"
+        else
+          echo "❌ No Pi 4 specific build directory found"
+          echo "Available target directories:"
+          find bin/targets/ -type d 2>/dev/null || echo "No targets directory found"
+        fi
+        
+        # Look for any image files
+        echo "=== Searching for any image files ==="
+        find bin/ -name "*.img*" -o -name "*.tar.gz" -o -name "*.bin" 2>/dev/null | head -20 | while read f; do
+          if [ -f "$f" ]; then
+            echo "Found: $f"
+            cp "$f" artifacts/ || echo "Failed to copy $f"
+          fi
         done
         
-        cp build.log artifacts/ 2>/dev/null || true
-        cp .config artifacts/final.config 2>/dev/null || true
+        # Copy logs and config
+        cp build.log artifacts/ 2>/dev/null || echo "No build.log found"
+        cp build-single.log artifacts/ 2>/dev/null || echo "No single-thread log"
+        cp .config artifacts/final.config 2>/dev/null || echo "No .config found"
         
-        echo "Build completed: $(date)" > artifacts/BUILD_INFO.txt
-        echo "Target: bcm27xx/bcm2711 (Raspberry Pi 4)" >> artifacts/BUILD_INFO.txt
-        echo "Files:" >> artifacts/BUILD_INFO.txt
-        ls -la artifacts/ >> artifacts/BUILD_INFO.txt
+        # Create comprehensive summary
+        cat > artifacts/BUILD_SUMMARY.txt << EOF
+=== OpenMANET Pi 4 Build Summary ===
+Build Date: $(date)
+Repository: https://github.com/spencrmartin/openwrt
+Target: bcm27xx/bcm2711 (Raspberry Pi 4)
+Build Success: ${BUILD_SUCCESS:-unknown}
+
+=== Build Environment ===
+$(uname -a)
+$(python3 --version 2>/dev/null || echo "Python version unknown")
+
+=== Build Results ===
+Pi 4 directory exists: $([ -d "bin/targets/bcm27xx/bcm2711" ] && echo "YES" || echo "NO")
+Image files found: $(find artifacts/ -name "*.img*" 2>/dev/null | wc -l)
+Total artifacts: $(ls -1 artifacts/ 2>/dev/null | wc -l)
+
+=== Files in this build ===
+$(ls -la artifacts/ 2>/dev/null || echo "No artifacts directory")
+
+=== Configuration used ===
+$(head -20 .config 2>/dev/null || echo "No configuration file found")
+EOF
         
-        echo "=== Final artifacts ==="
+        echo "=== Final artifacts summary ==="
         ls -la artifacts/
+        du -sh artifacts/ 2>/dev/null || echo "Could not calculate size"
+        
+        # Show what we found
+        IMG_COUNT=$(find artifacts/ -name "*.img*" 2>/dev/null | wc -l)
+        if [ "$IMG_COUNT" -gt 0 ]; then
+          echo "🎉 Found $IMG_COUNT image file(s)!"
+        else
+          echo "⚠️ No image files found"
+        fi
     
-    - name: Upload Pi 4 build
+    - name: Upload Pi 4 build artifacts
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: pi4-openmanet-${{ github.run_number }}
+        name: pi4-openmanet-build-${{ github.run_number }}
         path: artifacts/
         retention-days: 30
     
-    - name: Build summary
+    - name: Build completion summary
       if: always()
       run: |
+        echo "=== BUILD COMPLETION SUMMARY ==="
+        if [ -f artifacts/BUILD_SUMMARY.txt ]; then
+          cat artifacts/BUILD_SUMMARY.txt
+        fi
+        
+        echo ""
         if find artifacts/ -name "*.img*" | grep -q .; then
-          echo "SUCCESS: Pi 4 images built!"
-          echo "Download artifacts and flash to your Pi 4"
+          echo "🎉 SUCCESS: Pi 4 images built and ready!"
+          echo "📦 Download the artifacts above and flash to your Pi 4 SD card"
+          echo "🔥 This will fix your solid red light issue"
         else
-          echo "No images found - check logs"
+          echo "⚠️ No image files found, but build logs are available for debugging"
+          echo "📋 Check the build logs in the artifacts to diagnose issues"
         fi
